@@ -5,13 +5,23 @@ import os
 import re
 import threading
 import tkinter as tk
-from tkinter import filedialog, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext
+from typing import Callable
 
 from PIL import Image, ImageDraw
 
 from ..agent_loop import run_chat_turn
 from ..config import AppConfig, SETTINGS_FILE
 from ..context_manager import estimate_message_tokens
+from ..game.game_controller import GameController, InitialGameReview
+from ..game.initial_state_generator import InitialStateGenerator, OllamaInitialStateLLM
+from ..game.context_assembler import ContextAssembler
+from ..game.models import Choice, GameSave, GameViewState, PlayerAction
+from ..game.narrator_service import NarratorService, OllamaNarratorLLM
+from ..game.state_applier import StateApplier
+from ..game.state_validator import StateValidator
+from ..game.turn_processor import TurnProcessor
+from ..game.actions import PlayerActionSource
 from ..history_store import (
     create_empty_conversation,
     list_conversations,
@@ -21,8 +31,12 @@ from ..history_store import (
 from ..image_utils import ALLOWED_IMAGE_EXTENSIONS, image_file_to_base64
 from ..models import ChatMessage
 from ..ollama_client import OllamaClient
+from ..persistence.json_repository import JsonGameRepository
 from ..search_client import SearchClient
 from .image_attachment_bar import ImageAttachmentBar
+from .choice_panel import ChoicePanel
+from .developer_inspector import DeveloperInspectorWindow
+from .game_state_panel import GameStatePanel
 from .settings_dialog import SettingsDialog
 
 try:
@@ -89,6 +103,18 @@ class DesktopGremlinChatApp:
         self.config = config
         self.ollama_client = OllamaClient(config)
         self.search_client = SearchClient(config)
+        self.game_repository = JsonGameRepository()
+        self.game_controller = GameController(
+            self.game_repository,
+            InitialStateGenerator(OllamaInitialStateLLM(self.ollama_client, self.config)),
+            TurnProcessor(
+                repository=self.game_repository,
+                context_assembler=ContextAssembler(),
+                narrator_service=NarratorService(OllamaNarratorLLM(self.ollama_client, self.config)),
+                state_validator=StateValidator(),
+                state_applier=StateApplier(),
+            ),
+        )
 
         self.root.title("Desktop Gremlin")
         self.root.geometry("900x700")
@@ -98,6 +124,9 @@ class DesktopGremlinChatApp:
         self.is_waiting = False
         self.messages: list[ChatMessage] = []
         self.current_conversation = create_empty_conversation()
+        self.current_game_id: str | None = None
+        self.current_game_view: GameViewState | None = None
+        self.pending_game_choices: list[Choice] = []
         self.history_items: list[dict] = []
         self.loading_history_selection = False
         self.selected_image_paths: list[str] = []
@@ -236,6 +265,20 @@ class DesktopGremlinChatApp:
         )
         self.settings_button.grid(row=0, column=6, sticky="e", padx=(8, 12))
 
+        self.inspector_button = tk.Button(
+            header,
+            text="Inspector",
+            command=self.open_developer_inspector,
+            bg=c["button"],
+            fg=c["header_text"],
+            activebackground=c["button_hover"],
+            activeforeground=c["header_text"],
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=10,
+        )
+        self.inspector_button.grid(row=0, column=7, sticky="e", padx=(0, 12))
+
         self.body = tk.Frame(self.root, bg=c["window"])
         body = self.body
         body.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 8))
@@ -285,6 +328,11 @@ class DesktopGremlinChatApp:
         )
         self.history_scrollbar.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 8))
         self.history_listbox.configure(yscrollcommand=self.history_scrollbar.set)
+
+        self.game_state_panel = GameStatePanel(self.history_panel, bg=c["panel_alt"])
+        self.game_state_panel.apply_theme(bg=c["panel_alt"], fg=c["text"], muted=c["muted"])
+        self.game_state_panel.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        self.game_state_panel.set_view(None)
 
         self.transcript = scrolledtext.ScrolledText(
             body,
@@ -361,6 +409,16 @@ class DesktopGremlinChatApp:
         composer.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 14))
         composer.grid_columnconfigure(0, weight=1)
 
+        self.choice_panel = ChoicePanel(composer, on_choice=self.send_choice_action, bg=c["window"])
+        self.choice_panel.apply_theme(
+            bg=c["window"],
+            button_bg=c["button"],
+            button_fg=c["header_text"],
+            active_bg=c["button_hover"],
+        )
+        self.choice_panel.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 6))
+        self.choice_panel.clear_choices()
+
         self.attachment_bar = ImageAttachmentBar(
             composer,
             on_remove=self.remove_attached_image,
@@ -376,7 +434,13 @@ class DesktopGremlinChatApp:
             button_fg=c["header_text"],
             active_bg=c["button_hover"],
         )
-        self.attachment_bar.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+        self.choice_panel.apply_theme(
+            bg=c["window"],
+            button_bg=c["button"],
+            button_fg=c["header_text"],
+            active_bg=c["button_hover"],
+        )
+        self.attachment_bar.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 6))
         self.attachment_bar.set_paths([])
 
         self.input_text = tk.Text(
@@ -392,7 +456,7 @@ class DesktopGremlinChatApp:
             pady=9,
             font=("Segoe UI", 10),
         )
-        self.input_text.grid(row=1, column=0, sticky="ew")
+        self.input_text.grid(row=2, column=0, sticky="ew")
         self.input_text.bind("<Return>", self.handle_return)
         self.input_text.bind("<Shift-Return>", lambda _event: None)
 
@@ -408,7 +472,7 @@ class DesktopGremlinChatApp:
             relief="flat",
             font=("Segoe UI", 10),
         )
-        self.attach_button.grid(row=1, column=1, sticky="ns", padx=(8, 0))
+        self.attach_button.grid(row=2, column=1, sticky="ns", padx=(8, 0))
 
         self.send_button = tk.Button(
             composer,
@@ -422,7 +486,21 @@ class DesktopGremlinChatApp:
             relief="flat",
             font=("Segoe UI", 10, "bold"),
         )
-        self.send_button.grid(row=1, column=2, sticky="ns", padx=(8, 0))
+        self.send_button.grid(row=2, column=2, sticky="ns", padx=(8, 0))
+
+        self.new_game_button = tk.Button(
+            composer,
+            text="New Game",
+            command=self.open_new_game,
+            width=10,
+            bg=c["button"],
+            fg=c["header_text"],
+            activebackground=c["button_hover"],
+            activeforeground=c["header_text"],
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        self.new_game_button.grid(row=2, column=3, sticky="ns", padx=(8, 0))
 
         self.new_chat_button = tk.Button(
             composer,
@@ -436,7 +514,7 @@ class DesktopGremlinChatApp:
             relief="flat",
             font=("Segoe UI", 10),
         )
-        self.new_chat_button.grid(row=1, column=3, sticky="ns", padx=(8, 0))
+        self.new_chat_button.grid(row=2, column=4, sticky="ns", padx=(8, 0))
 
         self.helper_label = tk.Label(
             composer,
@@ -445,7 +523,7 @@ class DesktopGremlinChatApp:
             fg=c["muted"],
             font=("Segoe UI", 8),
         )
-        self.helper_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.helper_label.grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         self.update_status()
 
@@ -540,7 +618,14 @@ class DesktopGremlinChatApp:
         self.configure_option_menu(self.web_access_menu)
         self.configure_option_menu(self.python_access_menu)
 
-        for button in (self.theme_button, self.settings_button, self.attach_button, self.new_chat_button):
+        for button in (
+            self.theme_button,
+            self.settings_button,
+            self.inspector_button,
+            self.attach_button,
+            self.new_game_button,
+            self.new_chat_button,
+        ):
             button.configure(
                 bg=c["button"],
                 fg=c["header_text"],
@@ -565,6 +650,7 @@ class DesktopGremlinChatApp:
             selectbackground=c["accent"],
             selectforeground="#111111",
         )
+        self.game_state_panel.apply_theme(bg=c["panel_alt"], fg=c["text"], muted=c["muted"])
         self.composer.configure(bg=c["window"])
         self.helper_label.configure(bg=c["window"], fg=c["muted"])
         self.transcript.configure(
@@ -645,11 +731,62 @@ class DesktopGremlinChatApp:
     def new_chat(self) -> None:
         if self.is_waiting:
             return
+        self.current_game_id = None
+        self.current_game_view = None
+        self.pending_game_choices = []
+        self.choice_panel.clear_choices()
         self.start_fresh_conversation("New chat started. How can I help you?")
         self.refresh_history_list()
 
+    def open_new_game(self) -> None:
+        if self.is_waiting:
+            return
+        NewGameDialog(self.root, self.game_controller, self.show_accepted_game, self.colors)
+
+    def open_developer_inspector(self) -> None:
+        if self.current_game_id is None:
+            self.append_message("Assistant", "No active game to inspect.", "error")
+            return
+        DeveloperInspectorWindow(self.root, self.game_controller, self.current_game_id, self.colors)
+
+    def show_accepted_game(self, save: GameSave) -> None:
+        view = self.game_controller.get_game_view(save.campaign.id)
+        self.show_game_view(view, game_save_summary(save), f"Game saved: {save.campaign.title}")
+
+    def show_loaded_game(self, game_id: str) -> None:
+        view = self.game_controller.get_game_view(game_id)
+        self.show_game_view(view, game_view_summary(view), f"Game: {view.title} | Turn {view.state.turn_number}")
+
+    def show_game_view(self, view: GameViewState, transcript_text: str, status: str) -> None:
+        self.current_conversation = create_empty_conversation()
+        self.current_game_id = view.game_id
+        self.current_game_view = view
+        self.pending_game_choices = []
+        self.messages = []
+        self.trimmed_message_count = 0
+        self.last_prompt_tokens = None
+        self.last_output_tokens = None
+        self.last_context_total_tokens = None
+        self.clear_attached_images()
+
+        self.transcript.configure(state="normal")
+        self.transcript.delete("1.0", "end")
+        self.transcript.configure(state="disabled")
+
+        self.set_thinking_text("")
+        self.thinking_status_var.set("No thinking captured yet")
+        self.append_message("Assistant", transcript_text, "assistant")
+        self.choice_panel.set_choices(view.choices)
+        self.game_state_panel.set_view(view)
+        self.update_status(status)
+
     def start_fresh_conversation(self, greeting: str) -> None:
         self.current_conversation = create_empty_conversation()
+        self.current_game_id = None
+        self.current_game_view = None
+        self.pending_game_choices = []
+        self.choice_panel.clear_choices()
+        self.game_state_panel.set_view(None)
         self.messages = []
         self.trimmed_message_count = 0
         self.last_prompt_tokens = None
@@ -708,6 +845,11 @@ class DesktopGremlinChatApp:
             return
 
         self.current_conversation = conversation
+        self.current_game_id = None
+        self.current_game_view = None
+        self.pending_game_choices = []
+        self.choice_panel.clear_choices()
+        self.game_state_panel.set_view(None)
         messages = self.current_conversation.get("messages", [])
         self.messages = list(messages) if isinstance(messages, list) else []
         self.trimmed_message_count = 0
@@ -824,6 +966,10 @@ class DesktopGremlinChatApp:
             return
 
         text = self.input_text.get("1.0", "end").strip()
+        if self.current_game_id is not None:
+            self.send_game_action(text)
+            return
+
         image_paths = list(self.selected_image_paths)
         if not text and not image_paths:
             return
@@ -852,6 +998,73 @@ class DesktopGremlinChatApp:
             daemon=True,
         )
         worker.start()
+
+    def send_game_action(self, text: str) -> None:
+        if not text:
+            return
+        if self.selected_image_paths:
+            self.append_message("Assistant", "Game mode currently supports text actions only.", "error")
+            return
+        game_id = self.current_game_id
+        if game_id is None:
+            return
+        action = PlayerAction(source=PlayerActionSource.TEXT, text=text)
+        self.start_game_action(game_id, action, text)
+
+    def send_choice_action(self, choice: Choice) -> None:
+        if self.is_waiting:
+            return
+        game_id = self.current_game_id
+        view = self.current_game_view
+        if game_id is None or view is None:
+            return
+        current_choice = next((item for item in view.choices if item.id == choice.id), None)
+        if current_choice is None or current_choice.action_text != choice.action_text:
+            self.append_message("Assistant", f"Oops: Unknown or stale choice ID: {choice.id}", "error")
+            self.choice_panel.set_choices(view.choices)
+            return
+        action = PlayerAction(source=PlayerActionSource.CHOICE, text=choice.action_text, choice_id=choice.id)
+        self.start_game_action(game_id, action, choice.action_text)
+
+    def start_game_action(self, game_id: str, action: PlayerAction, display_text: str) -> None:
+        self.input_text.delete("1.0", "end")
+        self.pending_game_choices = list(self.current_game_view.choices) if self.current_game_view is not None else []
+        self.choice_panel.clear_choices()
+        self.append_message("You", display_text, "user")
+        self.set_waiting(True)
+        self.start_activity_animation("Resolving turn")
+        worker = threading.Thread(target=self.game_turn_worker, args=(game_id, action), daemon=True)
+        worker.start()
+
+    def game_turn_worker(self, game_id: str, action: PlayerAction) -> None:
+        try:
+            view = self.game_controller.submit_action(game_id, action)
+        except Exception as exc:
+            logging.exception("Game turn failed")
+            self.root.after(0, self.finish_game_turn_error, f"Oops: {exc}")
+            return
+        self.root.after(0, self.finish_game_turn, view)
+
+    def finish_game_turn(self, view: GameViewState) -> None:
+        self.current_game_id = view.game_id
+        self.current_game_view = view
+        self.pending_game_choices = []
+        self.append_message("Assistant", game_view_summary(view), "assistant")
+        self.choice_panel.set_choices(view.choices)
+        self.game_state_panel.set_view(view)
+        self.set_waiting(False)
+        self.stop_activity_animation()
+        self.update_status(f"Game: {view.title} | Turn {view.state.turn_number}")
+
+    def finish_game_turn_error(self, message: str) -> None:
+        self.append_message("Assistant", message, "error")
+        if self.current_game_view is not None:
+            self.choice_panel.set_choices(self.pending_game_choices or self.current_game_view.choices)
+        self.pending_game_choices = []
+        self.set_waiting(False)
+        self.stop_activity_animation()
+        if self.current_game_view is not None:
+            self.update_status(f"Game: {self.current_game_view.title} | Turn {self.current_game_view.state.turn_number}")
 
     def chat_worker(self, web_access_mode: str, python_access_mode: str) -> None:
         try:
@@ -1133,13 +1346,16 @@ class DesktopGremlinChatApp:
         state = "disabled" if waiting else "normal"
         self.send_button.configure(state=state)
         self.attach_button.configure(state=state)
+        self.new_game_button.configure(state=state)
         self.new_chat_button.configure(state=state)
+        self.inspector_button.configure(state=state)
         self.settings_button.configure(state=state)
         self.theme_button.configure(state=state)
         self.input_text.configure(state=state)
         self.web_access_menu.configure(state=state)
         self.python_access_menu.configure(state=state)
         self.history_listbox.configure(state=state)
+        self.choice_panel.set_enabled(not waiting)
         self.update_status("Thinking..." if waiting else None)
         if not waiting:
             self.input_text.configure(state="normal")
@@ -1221,6 +1437,316 @@ class DesktopGremlinChatApp:
         self.ollama_client.stop_model()
         self.ollama_client.shutdown_ollama_server()
         self.root.destroy()
+
+
+class NewGameDialog:
+    def __init__(
+        self,
+        root: tk.Tk,
+        controller: GameController,
+        on_accept: Callable[[GameSave], None],
+        colors: dict[str, str],
+    ):
+        self.root = root
+        self.controller = controller
+        self.on_accept = on_accept
+        self.colors = colors
+        self.review: InitialGameReview | None = None
+        self.campaign = None
+        self.is_generating = False
+
+        self.window = tk.Toplevel(root)
+        self.window.title("New Game")
+        self.window.geometry("720x680")
+        self.window.minsize(560, 520)
+        self.window.configure(bg=colors["window"])
+        self.window.transient(root)
+        self.window.grab_set()
+        self.window.grid_columnconfigure(0, weight=1)
+        self.window.grid_rowconfigure(0, weight=1)
+
+        self.container = tk.Frame(self.window, bg=colors["window"])
+        self.container.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        self.container.grid_columnconfigure(1, weight=1)
+        self.show_form()
+
+    def clear(self) -> None:
+        for child in self.container.winfo_children():
+            child.destroy()
+
+    def show_form(self) -> None:
+        self.clear()
+        c = self.colors
+        self.container.grid_rowconfigure(1, weight=0)
+        self.container.grid_rowconfigure(3, weight=1)
+        self.container.grid_rowconfigure(5, weight=1)
+
+        self.title_entry = self.add_entry("Campaign title", 0)
+        self.lore_text = self.add_text("Initial lore", 1, height=8)
+        self.premise_text = self.add_text("Player premise", 3, height=4)
+        self.tone_entry = self.add_entry("Tone/style", 5)
+        self.constraints_text = self.add_text("Content constraints", 6, height=3)
+
+        self.status_var = tk.StringVar(value="")
+        tk.Label(
+            self.container,
+            textvariable=self.status_var,
+            bg=c["window"],
+            fg=c["muted"],
+            anchor="w",
+            justify="left",
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        button_row = tk.Frame(self.container, bg=c["window"])
+        button_row.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        self.generate_button = self.dialog_button(button_row, "Generate", self.generate)
+        self.generate_button.pack(side="left", padx=(0, 8))
+        self.dialog_button(button_row, "Cancel", self.window.destroy).pack(side="left")
+
+    def add_entry(self, label: str, row: int) -> tk.Entry:
+        c = self.colors
+        tk.Label(self.container, text=label, bg=c["window"], fg=c["text"], anchor="w").grid(
+            row=row,
+            column=0,
+            sticky="nw",
+            padx=(0, 10),
+            pady=(0, 8),
+        )
+        entry = tk.Entry(
+            self.container,
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        entry.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        return entry
+
+    def add_text(self, label: str, row: int, height: int) -> tk.Text:
+        c = self.colors
+        tk.Label(self.container, text=label, bg=c["window"], fg=c["text"], anchor="w").grid(
+            row=row,
+            column=0,
+            sticky="nw",
+            padx=(0, 10),
+            pady=(0, 8),
+        )
+        text = tk.Text(
+            self.container,
+            height=height,
+            wrap="word",
+            bg=c["input"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief="flat",
+            padx=8,
+            pady=6,
+            font=("Segoe UI", 10),
+        )
+        text.grid(row=row, column=1, sticky="nsew", pady=(0, 8))
+        return text
+
+    def dialog_button(self, parent, text: str, command) -> tk.Button:
+        c = self.colors
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=c["button"],
+            fg=c["header_text"],
+            activebackground=c["button_hover"],
+            activeforeground=c["header_text"],
+            relief="flat",
+            padx=12,
+            pady=5,
+        )
+
+    def generate(self) -> None:
+        if self.is_generating:
+            return
+        try:
+            self.campaign = self.controller.build_campaign_definition(
+                title=self.title_entry.get(),
+                initial_lore=self.lore_text.get("1.0", "end").strip(),
+                player_premise=self.premise_text.get("1.0", "end").strip(),
+                tone=self.tone_entry.get(),
+                content_constraints=[
+                    line.strip()
+                    for line in self.constraints_text.get("1.0", "end").splitlines()
+                    if line.strip()
+                ],
+            )
+        except Exception as exc:
+            self.status_var.set(f"Invalid campaign details: {exc}")
+            return
+
+        self.is_generating = True
+        self.generate_button.configure(state="disabled")
+        self.status_var.set("Generating initial game state...")
+        threading.Thread(target=self.generate_worker, daemon=True).start()
+
+    def generate_worker(self) -> None:
+        try:
+            review = self.controller.generate_initial_review(self.campaign)
+        except Exception as exc:
+            logging.exception("Initial game generation failed")
+            self.root.after(0, self.finish_generation_error, str(exc))
+            return
+        self.root.after(0, self.show_review, review)
+
+    def finish_generation_error(self, message: str) -> None:
+        self.is_generating = False
+        self.generate_button.configure(state="normal")
+        self.status_var.set(f"Generation failed: {message}")
+
+    def show_review(self, review: InitialGameReview) -> None:
+        self.review = review
+        self.is_generating = False
+        self.clear()
+        c = self.colors
+        self.container.grid_columnconfigure(0, weight=1)
+        self.container.grid_rowconfigure(0, weight=1)
+
+        review_text = scrolledtext.ScrolledText(
+            self.container,
+            wrap="word",
+            bg=c["panel"],
+            fg=c["text"],
+            insertbackground=c["text"],
+            relief="flat",
+            padx=12,
+            pady=10,
+            font=("Segoe UI", 10),
+        )
+        review_text.grid(row=0, column=0, sticky="nsew")
+        review_text.insert("end", review_summary(review))
+        review_text.configure(state="disabled")
+
+        button_row = tk.Frame(self.container, bg=c["window"])
+        button_row.grid(row=1, column=0, sticky="e", pady=(12, 0))
+        self.dialog_button(button_row, "Start Game", self.accept).pack(side="left", padx=(0, 8))
+        self.dialog_button(button_row, "Regenerate", self.regenerate).pack(side="left", padx=(0, 8))
+        self.dialog_button(button_row, "Cancel", self.window.destroy).pack(side="left")
+
+    def regenerate(self) -> None:
+        if self.review is None or self.is_generating:
+            return
+        self.is_generating = True
+        self.clear()
+        c = self.colors
+        tk.Label(
+            self.container,
+            text="Regenerating initial game state...",
+            bg=c["window"],
+            fg=c["text"],
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        threading.Thread(target=self.regenerate_worker, daemon=True).start()
+
+    def regenerate_worker(self) -> None:
+        try:
+            review = self.controller.regenerate_initial_review(self.review)
+        except Exception as exc:
+            logging.exception("Initial game regeneration failed")
+            self.root.after(0, self.show_regeneration_error, str(exc))
+            return
+        self.root.after(0, self.show_review, review)
+
+    def show_regeneration_error(self, message: str) -> None:
+        self.is_generating = False
+        messagebox.showerror("New Game", f"Regeneration failed:\n{message}", parent=self.window)
+        if self.review is not None:
+            self.show_review(self.review)
+        else:
+            self.show_form()
+
+    def accept(self) -> None:
+        if self.review is None:
+            return
+        try:
+            save = self.controller.accept_initial_review(self.review)
+        except Exception as exc:
+            logging.exception("Saving generated game failed")
+            messagebox.showerror("New Game", f"Could not save game:\n{exc}", parent=self.window)
+            return
+        self.window.destroy()
+        self.on_accept(save)
+
+
+def review_summary(review: InitialGameReview) -> str:
+    state = review.initial_state.state
+    location = state.locations[state.current_location_id]
+    inventory = [
+        f"- {state.item_definitions[item_id].name}: {entry.quantity}"
+        for item_id, entry in state.inventory.items()
+    ] or ["- None"]
+    characters = [
+        f"- {character.name}: {character.status}"
+        for character in state.characters.values()
+    ] or ["- None"]
+    quests = [
+        f"- {quest.title}: {quest.status} / {quest.stage}"
+        for quest in state.quests.values()
+    ] or ["- None"]
+    choices = [
+        f"- {choice.label}: {choice.action_text}"
+        for choice in review.initial_state.initial_choices
+    ] or ["- None"]
+
+    return "\n".join(
+        [
+            f"Campaign: {review.campaign.title}",
+            "",
+            "Opening Narrative",
+            review.opening_narrative,
+            "",
+            "Player",
+            f"{state.player.name}: {state.player.status}",
+            state.player.description,
+            "",
+            "Starting Location",
+            f"{location.name}: {location.description}",
+            "",
+            "Starting Inventory",
+            *inventory,
+            "",
+            "Initial Characters",
+            *characters,
+            "",
+            "Initial Quests",
+            *quests,
+            "",
+            "Initial Choices",
+            *choices,
+        ]
+    )
+
+
+def game_save_summary(save: GameSave) -> str:
+    location = save.state.locations[save.state.current_location_id]
+    choices = "\n".join(f"- {choice.label}" for choice in save.current_choices) or "- None"
+    return (
+        f"Game started: {save.campaign.title}\n\n"
+        f"{save.state.player.name} begins at {location.name}.\n\n"
+        f"Initial canon is saved unchanged with the campaign.\n\n"
+        f"Available choices:\n{choices}"
+    )
+
+
+def game_view_summary(view: GameViewState) -> str:
+    state = view.state
+    location = state.locations[state.current_location_id]
+    player_location = state.locations.get(state.player.current_location_id or state.current_location_id, location)
+    choices = "\n".join(f"- {choice.label}" for choice in view.choices) or "- None"
+    return (
+        f"{view.narrative}\n\n"
+        f"Turn: {state.turn_number}\n"
+        f"Scene: {location.name}\n"
+        f"Player location: {player_location.name}\n\n"
+        f"Available choices:\n{choices}"
+    )
 
 
 def create_tray_image() -> Image.Image:
