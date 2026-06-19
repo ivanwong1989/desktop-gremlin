@@ -1,6 +1,15 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 .venv/
 venv/
+*.egg-info/
 .env
-.env
+
+desktop_gremlin.log
+desktop_gremlin_settings.json
+history/
+data/
+generated/
+*.tmp
+*.bak
