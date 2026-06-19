@@ -15,7 +15,7 @@ class StateApplier:
 
     def apply_one(self, state: GameState, change: StateChange) -> None:
         operation = change.operation
-        params = deepcopy(change.parameters)
+        params = deepcopy(change.parameters.model_dump(exclude_none=True))
 
         if operation == StateChangeOperation.SET_FLAG:
             state.world_flags[str(params["key"])] = params.get("value", True)
@@ -40,18 +40,18 @@ class StateApplier:
             if change.target_id == state.player.id:
                 state.current_location_id = str(params["location_id"])
         elif operation == StateChangeOperation.CREATE_CHARACTER:
-            character = CharacterState.model_validate(params["character"])
+            character = CharacterState.model_validate(params)
             state.characters[character.id] = character
         elif operation == StateChangeOperation.UPDATE_CHARACTER:
             character = state.player if change.target_id == state.player.id else state.characters[str(change.target_id)]
             self.update_model_fields(character, params, {"name", "description", "status", "current_location_id", "attributes"})
         elif operation == StateChangeOperation.CREATE_LOCATION:
-            location = LocationState.model_validate(params["location"])
+            location = LocationState.model_validate(params)
             state.locations[location.id] = location
         elif operation == StateChangeOperation.DISCOVER_LOCATION:
             state.locations[str(change.target_id)].discovered = True
         elif operation == StateChangeOperation.START_QUEST:
-            quest = QuestState.model_validate(params["quest"])
+            quest = QuestState.model_validate(params)
             state.quests[quest.id] = quest
         elif operation == StateChangeOperation.UPDATE_QUEST:
             quest = state.quests[str(change.target_id)]

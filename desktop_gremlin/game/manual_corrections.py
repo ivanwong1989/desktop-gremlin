@@ -6,7 +6,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .actions import StateChangeOperation
-from .models import GameSave, GameViewState, StateChange, TurnEvent
+from .models import GameSave, GameViewState, StateChange, TurnEvent, parse_state_change
 from .state_applier import StateApplier
 from .state_validator import StateValidator
 from .turn_processor import view_from_save
@@ -51,65 +51,43 @@ class ManualCorrectionService:
     def add_item(self, game_id: str, item_id: str, quantity: int, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.ADD_ITEM,
-                target_id=item_id,
-                parameters={"quantity": quantity},
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.ADD_ITEM, "target_id": item_id,
+                                "parameters": {"quantity": quantity}, "reason": reason}),
         )
 
     def remove_item(self, game_id: str, item_id: str, quantity: int, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.REMOVE_ITEM,
-                target_id=item_id,
-                parameters={"quantity": quantity},
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.REMOVE_ITEM, "target_id": item_id,
+                                "parameters": {"quantity": quantity}, "reason": reason}),
         )
 
     def move_character(self, game_id: str, character_id: str, location_id: str, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.MOVE_CHARACTER,
-                target_id=character_id,
-                parameters={"location_id": location_id},
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.MOVE_CHARACTER, "target_id": character_id,
+                                "parameters": {"location_id": location_id}, "reason": reason}),
         )
 
     def set_flag(self, game_id: str, key: str, value, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.SET_FLAG,
-                parameters={"key": key, "value": value},
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.SET_FLAG,
+                                "parameters": {"key": key, "value": value}, "reason": reason}),
         )
 
     def remove_flag(self, game_id: str, key: str, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.REMOVE_FLAG,
-                target_id=key,
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.REMOVE_FLAG, "target_id": key,
+                                "reason": reason}),
         )
 
     def adjust_quest_status(self, game_id: str, quest_id: str, status: str, reason: str) -> GameViewState:
         return self.apply_correction(
             game_id,
-            StateChange(
-                operation=StateChangeOperation.UPDATE_QUEST,
-                target_id=quest_id,
-                parameters={"status": status},
-                reason=reason,
-            ),
+            parse_state_change({"operation": StateChangeOperation.UPDATE_QUEST, "target_id": quest_id,
+                                "parameters": {"status": status}, "reason": reason}),
         )
 
     def correct_current_location(self, game_id: str, location_id: str, reason: str) -> GameViewState:

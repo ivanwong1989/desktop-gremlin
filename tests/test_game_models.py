@@ -20,6 +20,7 @@ from desktop_gremlin.game.models import (
     QuestState,
     StateChange,
     StorySummary,
+    parse_state_change,
 )
 from desktop_gremlin.game.schemas import INITIAL_GAME_STATE_SCHEMA, NARRATOR_TURN_SCHEMA
 
@@ -181,21 +182,108 @@ def test_keyed_entity_ids_must_match_keys() -> None:
 
 def test_invalid_state_change_operation_fails() -> None:
     with pytest.raises(ValidationError):
-        StateChange(operation="mutate_any_path", reason="Not allowed.")
+        parse_state_change({"operation": "mutate_any_path", "reason": "Not allowed."})
 
 
-def test_state_change_rejects_arbitrary_path_parameters() -> None:
-    with pytest.raises(ValidationError, match="not arbitrary paths"):
-        StateChange(
-            operation=StateChangeOperation.SET_FLAG,
-            parameters={"player.stats.strength": 99},
-            reason="No arbitrary object paths.",
-        )
+def test_state_change_rejects_unknown_parameter_fields() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        parse_state_change({
+            "operation": StateChangeOperation.SET_FLAG,
+            "parameters": {"key": "strength", "player.stats.strength": 99},
+            "reason": "No arbitrary object paths.",
+        })
 
 
 def test_state_change_requires_target_for_targeted_operations() -> None:
-    with pytest.raises(ValidationError, match="target_id is required"):
-        StateChange(operation=StateChangeOperation.REMOVE_ITEM, reason="Spent the item.")
+    with pytest.raises(ValidationError, match="Field required"):
+        parse_state_change({"operation": StateChangeOperation.REMOVE_ITEM, "reason": "Spent the item."})
+
+
+def test_create_location_contract_accepts_direct_entity_and_forbids_target() -> None:
+    valid = {
+        "operation": "create_location",
+        "parameters": {
+            "id": "office-pantry",
+            "name": "Office Pantry",
+            "description": "A small pantry near the office floor.",
+            "discovered": True,
+            "attributes": {},
+        },
+        "reason": "Ivan walks to the pantry to get coffee.",
+    }
+    change = parse_state_change(valid)
+    assert change.parameters.id == "office-pantry"
+
+    with pytest.raises(ValidationError, match="target_id"):
+        parse_state_change({**valid, "target_id": "office-pantry"})
+
+    missing_id = {**valid, "parameters": {key: value for key, value in valid["parameters"].items() if key != "id"}}
+    with pytest.raises(ValidationError, match="Field required"):
+        parse_state_change(missing_id)
+
+
+def test_create_character_uses_parameters_id_and_forbids_target() -> None:
+    valid = {
+        "operation": "create_character",
+        "parameters": {
+            "id": "barista",
+            "name": "Barista",
+            "description": "The office barista.",
+            "status": "working",
+        },
+        "reason": "The barista is now relevant.",
+    }
+    assert parse_state_change(valid).parameters.id == "barista"
+    with pytest.raises(ValidationError, match="target_id"):
+        parse_state_change({**valid, "target_id": "barista"})
+
+
+def test_unknown_top_level_state_change_field_fails() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        parse_state_change({
+            "operation": "set_flag",
+            "parameters": {"key": "coffee_ready"},
+            "reason": "Coffee is ready.",
+            "unexpected": True,
+        })
+
+
+def test_complete_valid_narrator_turn_with_typed_changes_parses() -> None:
+    turn = NarratorTurn.model_validate({
+        "schema_version": 1,
+        "narrative": "Ivan heads to the pantry.",
+        "choices": [],
+        "state_changes": [
+            {
+                "operation": "create_location",
+                "parameters": {"id": "office-pantry", "name": "Office Pantry", "description": "A pantry."},
+                "reason": "The pantry becomes relevant.",
+            },
+            {
+                "operation": "move_character",
+                "target_id": "player",
+                "parameters": {"location_id": "office-pantry"},
+                "reason": "Ivan walks there.",
+            },
+        ],
+        "memory_signals": [],
+        "image_request": None,
+    })
+    assert [change.operation.value for change in turn.state_changes] == ["create_location", "move_character"]
+
+
+def test_legacy_nested_create_payload_parses_without_rewriting_source_records() -> None:
+    turn = NarratorTurn.model_validate({
+        "narrative": "A historical turn.",
+        "state_changes": [{
+            "operation": "create_location",
+            "parameters": {
+                "location": {"id": "old-place", "name": "Old Place", "description": "A legacy location."}
+            },
+            "reason": "This record predates the direct create contract.",
+        }],
+    })
+    assert turn.state_changes[0].parameters.id == "old-place"
 
 
 def test_empty_narrative_and_empty_choice_label_fail() -> None:
@@ -220,3 +308,5 @@ def test_narrator_turn_choice_ids_are_unique() -> None:
 def test_json_schemas_are_available_for_llm_contracts() -> None:
     assert INITIAL_GAME_STATE_SCHEMA["title"] == "InitialGameState"
     assert NARRATOR_TURN_SCHEMA["title"] == "NarratorTurn"
+    state_changes = NARRATOR_TURN_SCHEMA["properties"]["state_changes"]["items"]
+    assert state_changes["discriminator"]["propertyName"] == "operation"

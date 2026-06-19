@@ -25,6 +25,7 @@ def developer_inspector_text(
     applied = debug.applied_state_changes if debug else (latest_turn.applied_state_changes if latest_turn else [])
     context = debug.latest_model_context if debug else []
     failure = debug.validation_failure if debug else None
+    raw_model_output = debug.raw_model_output if debug else None
 
     sections = [
         ("Complete canonical state", view.state.model_dump(mode="json") if view else None),
@@ -33,6 +34,7 @@ def developer_inspector_text(
         ("Proposed state changes", [change.model_dump(mode="json") for change in proposed]),
         ("Applied state changes", [change.model_dump(mode="json") for change in applied]),
         ("Validation failures", failure or "None"),
+        ("Raw model output", raw_model_output or "None"),
         ("Latest model context", context),
         ("Event-log records", [event.model_dump(mode="json") for event in events]),
         ("Current choices", [choice.model_dump(mode="json") for choice in view.choices] if view else []),

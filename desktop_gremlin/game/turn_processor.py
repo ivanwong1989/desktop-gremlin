@@ -25,6 +25,7 @@ class TurnDebugSnapshot:
     proposed_state_changes: list[StateChange] = field(default_factory=list)
     applied_state_changes: list[StateChange] = field(default_factory=list)
     validation_failure: str | None = None
+    raw_model_output: str | None = None
     latest_model_context: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -63,6 +64,7 @@ class TurnProcessor:
             self.state_validator.validate_all(save.state, narrator_turn.state_changes)
         except Exception as exc:
             debug.validation_failure = str(exc)
+            debug.raw_model_output = getattr(exc, "raw_output", None)
             raise
 
         candidate = save.model_copy(deep=True)

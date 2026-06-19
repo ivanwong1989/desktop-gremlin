@@ -42,8 +42,30 @@ class NarratorService:
         try:
             parsed = json.loads(extract_json_text(response_text))
         except json.JSONDecodeError as exc:
-            raise NarratorTurnError(f"Invalid narrator JSON: {exc}") from exc
+            raise NarratorTurnError(f"Invalid narrator JSON: {exc}", raw_output=response_text) from exc
         try:
             return NarratorTurn.model_validate(parsed)
         except ValidationError as exc:
-            raise NarratorTurnError(f"Narrator turn failed validation: {exc}") from exc
+            details = []
+            changes = parsed.get("state_changes", []) if isinstance(parsed, dict) else []
+            for error in exc.errors(include_url=False):
+                location = error["loc"]
+                index = _state_change_index(location)
+                operation = None
+                if index is not None and isinstance(changes, list) and index < len(changes):
+                    candidate = changes[index]
+                    if isinstance(candidate, dict):
+                        operation = candidate.get("operation")
+                prefix = f"state_changes[{index}]" if index is not None else ".".join(map(str, location))
+                if operation:
+                    prefix += f" operation={operation}"
+                details.append(f"{prefix}: {error['msg']}")
+            message = "Narrator turn failed validation: " + "; ".join(details)
+            raise NarratorTurnError(message, raw_output=response_text) from exc
+
+
+def _state_change_index(location: tuple) -> int | None:
+    for position, part in enumerate(location[:-1]):
+        if part == "state_changes" and isinstance(location[position + 1], int):
+            return location[position + 1]
+    return None

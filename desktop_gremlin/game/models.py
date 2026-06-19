@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, ClassVar, Literal, TypeAlias, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator, model_validator
 
 from .actions import PlayerActionSource, StateChangeOperation
 
@@ -240,21 +240,124 @@ class GameState(VersionedModel):
         return self
 
 
-class StateChange(StrictGameModel):
-    operation: StateChangeOperation
-    target_id: str | None = None
-    parameters: dict[str, JsonValue] = Field(default_factory=dict)
-    reason: str = Field(min_length=1)
+class StateChangeParameters(StrictGameModel):
+    """Base for operation-specific parameter objects."""
 
-    @field_validator("target_id")
+
+class EmptyParameters(StateChangeParameters):
+    pass
+
+
+class SetFlagParameters(StateChangeParameters):
+    key: str = Field(min_length=1)
+    value: JsonValue = True
+
+
+class QuantityParameters(StateChangeParameters):
+    quantity: int = Field(default=1, gt=0, strict=True)
+
+
+class MoveCharacterParameters(StateChangeParameters):
+    location_id: str = Field(min_length=1)
+
+
+class CreateCharacterParameters(StateChangeParameters):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    current_location_id: str | None = None
+    attributes: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
     @classmethod
-    def strip_target_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            raise ValueError("target_id must not be empty when provided")
+    def accept_legacy_character_wrapper(cls, value: Any) -> Any:
+        if isinstance(value, dict) and set(value) == {"character"} and isinstance(value["character"], dict):
+            return value["character"]
         return value
+
+
+class UpdateCharacterParameters(StateChangeParameters):
+    name: str = Field(default=None, min_length=1)
+    description: str = Field(default=None, min_length=1)
+    status: str = Field(default=None, min_length=1)
+    current_location_id: str = Field(default=None, min_length=1)
+    attributes: dict[str, JsonValue] = None
+
+    @model_validator(mode="after")
+    def require_update(self) -> "UpdateCharacterParameters":
+        if not self.model_fields_set:
+            raise ValueError("at least one character field must be provided")
+        return self
+
+
+class CreateLocationParameters(StateChangeParameters):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    discovered: bool = False
+    attributes: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_location_wrapper(cls, value: Any) -> Any:
+        if isinstance(value, dict) and set(value) == {"location"} and isinstance(value["location"], dict):
+            return value["location"]
+        return value
+
+
+class StartQuestParameters(StateChangeParameters):
+    id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    status: Literal["not_started", "active", "completed", "failed"]
+    stage: str = Field(min_length=1)
+    attributes: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_quest_wrapper(cls, value: Any) -> Any:
+        if isinstance(value, dict) and set(value) == {"quest"} and isinstance(value["quest"], dict):
+            return value["quest"]
+        return value
+
+
+class UpdateQuestParameters(StateChangeParameters):
+    title: str = Field(default=None, min_length=1)
+    description: str = Field(default=None, min_length=1)
+    status: Literal["not_started", "active", "completed", "failed"] = None
+    stage: str = Field(default=None, min_length=1)
+    attributes: dict[str, JsonValue] = None
+
+    @model_validator(mode="after")
+    def require_update(self) -> "UpdateQuestParameters":
+        if not self.model_fields_set:
+            raise ValueError("at least one quest field must be provided")
+        return self
+
+
+class GameTimeParameters(StateChangeParameters):
+    value: str = Field(min_length=1)
+
+
+class PresentCharactersParameters(StateChangeParameters):
+    character_ids: list[str]
+
+    @field_validator("character_ids")
+    @classmethod
+    def validate_character_ids(cls, value: list[str]) -> list[str]:
+        stripped = [item.strip() for item in value]
+        if any(not item for item in stripped):
+            raise ValueError("character_ids must contain non-empty strings")
+        if len(set(stripped)) != len(stripped):
+            raise ValueError("character_ids must not contain duplicates")
+        return stripped
+
+
+class StateChangeBase(StrictGameModel):
+    entity_requirement: ClassVar[str] = "none"
+    creates_entity: ClassVar[bool] = False
+    reason: str = Field(min_length=1)
 
     @field_validator("reason")
     @classmethod
@@ -264,43 +367,166 @@ class StateChange(StrictGameModel):
             raise ValueError("reason must not be empty")
         return value
 
-    @field_validator("parameters")
+class TargetedStateChange(StateChangeBase):
+    target_id: str = Field(min_length=1)
+
+    @field_validator("target_id")
     @classmethod
-    def reject_arbitrary_paths(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        for key in value:
-            if not key.strip():
-                raise ValueError("parameter keys must not be empty")
-            if "." in key or "[" in key or "]" in key:
-                raise ValueError("parameter keys must be structured names, not arbitrary paths")
+    def strip_target_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("target_id must not be empty")
         return value
 
-    @model_validator(mode="after")
-    def validate_operation_shape(self) -> "StateChange":
-        operations_requiring_target = {
-            StateChangeOperation.REMOVE_FLAG,
-            StateChangeOperation.ADD_ITEM,
-            StateChangeOperation.REMOVE_ITEM,
-            StateChangeOperation.MOVE_CHARACTER,
-            StateChangeOperation.UPDATE_CHARACTER,
-            StateChangeOperation.DISCOVER_LOCATION,
-            StateChangeOperation.UPDATE_QUEST,
-            StateChangeOperation.COMPLETE_QUEST,
-            StateChangeOperation.FAIL_QUEST,
-        }
-        operations_without_target = {
-            StateChangeOperation.SET_FLAG,
-            StateChangeOperation.CREATE_CHARACTER,
-            StateChangeOperation.CREATE_LOCATION,
-            StateChangeOperation.START_QUEST,
-            StateChangeOperation.SET_GAME_TIME,
-            StateChangeOperation.ADVANCE_GAME_TIME,
-            StateChangeOperation.SET_PRESENT_CHARACTERS,
-        }
-        if self.operation in operations_requiring_target and not self.target_id:
-            raise ValueError(f"target_id is required for {self.operation.value}")
-        if self.operation in operations_without_target and self.target_id is not None:
-            raise ValueError(f"target_id is not allowed for {self.operation.value}")
-        return self
+
+class SetFlagChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.SET_FLAG]
+    parameters: SetFlagParameters
+
+
+class RemoveFlagChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.REMOVE_FLAG]
+    parameters: EmptyParameters = Field(default_factory=EmptyParameters)
+    entity_requirement: ClassVar[str] = "world flag target_id must exist"
+
+
+class AddItemChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.ADD_ITEM]
+    parameters: QuantityParameters = Field(default_factory=QuantityParameters)
+    entity_requirement: ClassVar[str] = "item definition target_id must exist"
+
+
+class RemoveItemChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.REMOVE_ITEM]
+    parameters: QuantityParameters = Field(default_factory=QuantityParameters)
+    entity_requirement: ClassVar[str] = "inventory item target_id must exist"
+
+
+class MoveCharacterChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.MOVE_CHARACTER]
+    parameters: MoveCharacterParameters
+    entity_requirement: ClassVar[str] = "character target_id and parameters.location_id must exist"
+
+
+class CreateCharacterChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.CREATE_CHARACTER]
+    parameters: CreateCharacterParameters
+    entity_requirement: ClassVar[str] = "parameters.current_location_id must exist when provided"
+    creates_entity: ClassVar[bool] = True
+
+
+class UpdateCharacterChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.UPDATE_CHARACTER]
+    parameters: UpdateCharacterParameters
+    entity_requirement: ClassVar[str] = "character target_id and any current_location_id must exist"
+
+
+class CreateLocationChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.CREATE_LOCATION]
+    parameters: CreateLocationParameters
+    creates_entity: ClassVar[bool] = True
+
+
+class DiscoverLocationChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.DISCOVER_LOCATION]
+    parameters: EmptyParameters = Field(default_factory=EmptyParameters)
+    entity_requirement: ClassVar[str] = "location target_id must exist"
+
+
+class StartQuestChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.START_QUEST]
+    parameters: StartQuestParameters
+    creates_entity: ClassVar[bool] = True
+
+
+class UpdateQuestChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.UPDATE_QUEST]
+    parameters: UpdateQuestParameters
+    entity_requirement: ClassVar[str] = "quest target_id must exist"
+
+
+class CompleteQuestChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.COMPLETE_QUEST]
+    parameters: EmptyParameters = Field(default_factory=EmptyParameters)
+    entity_requirement: ClassVar[str] = "quest target_id must exist"
+
+
+class FailQuestChange(TargetedStateChange):
+    operation: Literal[StateChangeOperation.FAIL_QUEST]
+    parameters: EmptyParameters = Field(default_factory=EmptyParameters)
+    entity_requirement: ClassVar[str] = "quest target_id must exist"
+
+
+class SetGameTimeChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.SET_GAME_TIME]
+    parameters: GameTimeParameters
+
+
+class AdvanceGameTimeChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.ADVANCE_GAME_TIME]
+    parameters: GameTimeParameters
+
+
+class SetPresentCharactersChange(StateChangeBase):
+    operation: Literal[StateChangeOperation.SET_PRESENT_CHARACTERS]
+    parameters: PresentCharactersParameters
+    entity_requirement: ClassVar[str] = "every parameters.character_ids entry must exist"
+
+
+STATE_CHANGE_MODELS = (
+    SetFlagChange, RemoveFlagChange, AddItemChange, RemoveItemChange, MoveCharacterChange,
+    CreateCharacterChange, UpdateCharacterChange, CreateLocationChange, DiscoverLocationChange,
+    StartQuestChange, UpdateQuestChange, CompleteQuestChange, FailQuestChange,
+    SetGameTimeChange, AdvanceGameTimeChange, SetPresentCharactersChange,
+)
+
+StateChange: TypeAlias = Annotated[
+    SetFlagChange | RemoveFlagChange | AddItemChange | RemoveItemChange | MoveCharacterChange
+    | CreateCharacterChange | UpdateCharacterChange | CreateLocationChange | DiscoverLocationChange
+    | StartQuestChange | UpdateQuestChange | CompleteQuestChange | FailQuestChange
+    | SetGameTimeChange | AdvanceGameTimeChange | SetPresentCharactersChange,
+    Field(discriminator="operation"),
+]
+STATE_CHANGE_ADAPTER = TypeAdapter(StateChange)
+
+
+def parse_state_change(value: Any) -> StateChange:
+    """Validate one state change outside a containing NarratorTurn."""
+    return STATE_CHANGE_ADAPTER.validate_python(value)
+
+
+def state_change_operation_reference() -> str:
+    """Build prompt guidance from the same models that generate the JSON schema."""
+    lines: list[str] = []
+    for model in STATE_CHANGE_MODELS:
+        operation = get_args(model.model_fields["operation"].annotation)[0]
+        operation_name = operation.value if isinstance(operation, StateChangeOperation) else str(operation)
+        target_rule = "required" if "target_id" in model.model_fields else "forbidden"
+        parameters_model = model.model_fields["parameters"].annotation
+        parameter_schema = parameters_model.model_json_schema()
+        required = set(parameter_schema.get("required", []))
+        fields = []
+        for name, schema in parameter_schema.get("properties", {}).items():
+            requirement = "required" if name in required else "optional"
+            fields.append(f"{name}:{_json_schema_type(schema)} {requirement}")
+        parameter_text = ", ".join(fields) if fields else "none"
+        creates = "; creates a new entity" if model.creates_entity else ""
+        lines.append(
+            f"- {operation_name}: target_id {target_rule}; parameters {{{parameter_text}}}; "
+            f"existing state: {model.entity_requirement}{creates}."
+        )
+    return "\n".join(lines)
+
+
+def _json_schema_type(schema: dict[str, Any]) -> str:
+    if "$ref" in schema:
+        return schema["$ref"].rsplit("/", 1)[-1]
+    if "type" in schema:
+        value = schema["type"]
+        return "/".join(value) if isinstance(value, list) else str(value)
+    if "anyOf" in schema:
+        return "/".join(dict.fromkeys(_json_schema_type(item) for item in schema["anyOf"]))
+    return "value"
 
 
 class InitialGameState(VersionedModel):

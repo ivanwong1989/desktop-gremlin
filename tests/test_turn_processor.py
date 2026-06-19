@@ -63,9 +63,9 @@ def narrator_payload(
     }
 
 
-def build_turn_controller(tmp_path, narrator_responses: list[str], repository=None):
+def build_turn_controller(tmp_path, narrator_responses: list[str], repository=None, initial_payload=None):
     repository = repository or JsonGameRepository(tmp_path / "campaigns")
-    initial_llm = FakeInitialStateLLM([json_response(initial_state_payload())])
+    initial_llm = FakeInitialStateLLM([json_response(initial_payload or initial_state_payload())])
     narrator_llm = FakeNarratorLLM(narrator_responses)
     turn_processor = TurnProcessor(
         repository=repository,
@@ -215,13 +215,11 @@ def test_multiple_valid_state_changes_apply_atomically(tmp_path) -> None:
         {
             "operation": "create_location",
             "parameters": {
-                "location": {
-                    "id": "abbey-road",
-                    "name": "Abbey Road",
-                    "description": "A wet road climbing north.",
-                    "discovered": True,
-                    "attributes": {},
-                }
+                "id": "abbey-road",
+                "name": "Abbey Road",
+                "description": "A wet road climbing north.",
+                "discovered": True,
+                "attributes": {},
             },
             "reason": "The road becomes relevant.",
         },
@@ -336,13 +334,11 @@ def test_narrative_state_consistency_after_move(tmp_path) -> None:
         {
             "operation": "create_location",
             "parameters": {
-                "location": {
-                    "id": "gatehouse",
-                    "name": "Gatehouse",
-                    "description": "A stone gatehouse.",
-                    "discovered": True,
-                    "attributes": {},
-                }
+                "id": "gatehouse",
+                "name": "Gatehouse",
+                "description": "A stone gatehouse.",
+                "discovered": True,
+                "attributes": {},
             },
             "reason": "The gatehouse is reached.",
         },
@@ -384,6 +380,75 @@ def test_context_ordering(tmp_path) -> None:
     ]
     positions = [content.index(section) for section in expected]
     assert positions == sorted(positions)
+
+
+def test_coffee_run_creates_location_then_moves_player_sequentially(tmp_path) -> None:
+    payload = initial_state_payload()
+    state = payload["state"]
+    state["player"].update({"id": "ivan", "name": "Ivan", "current_location_id": "office-floor"})
+    state["locations"] = {
+        "office-floor": {
+            "id": "office-floor",
+            "name": "Office Floor",
+            "description": "An open-plan office.",
+            "discovered": True,
+            "attributes": {},
+        }
+    }
+    state["characters"] = {}
+    state["current_location_id"] = "office-floor"
+    state["present_character_ids"] = ["ivan"]
+    changes = [
+        {
+            "operation": "create_location",
+            "parameters": {
+                "id": "office-pantry",
+                "name": "Office Pantry",
+                "description": "A small pantry near the office floor.",
+                "discovered": True,
+                "attributes": {},
+            },
+            "reason": "Ivan chooses to get coffee.",
+        },
+        {
+            "operation": "move_character",
+            "target_id": "ivan",
+            "parameters": {"location_id": "office-pantry"},
+            "reason": "Ivan walks into the pantry.",
+        },
+    ]
+    controller, save, _llm = build_turn_controller(
+        tmp_path,
+        [json_response(narrator_payload(changes, narrative="Ivan walks to the pantry for coffee."))],
+        initial_payload=payload,
+    )
+
+    view = controller.submit_action(save.campaign.id, text_action("Get coffee."))
+
+    assert list(view.state.locations)[-1] == "office-pantry"
+    assert view.state.current_location_id == "office-pantry"
+    assert view.state.player.current_location_id == "office-pantry"
+
+
+def test_narrator_validation_error_retains_raw_output_index_and_operation(tmp_path) -> None:
+    invalid = narrator_payload([
+        {
+            "operation": "create_location",
+            "target_id": "office-pantry",
+            "parameters": {"name": "Office Pantry"},
+            "reason": "An invalid create payload.",
+        }
+    ])
+    raw = json_response(invalid)
+    controller, save, _llm = build_turn_controller(tmp_path, [raw])
+
+    with pytest.raises(NarratorTurnError, match=r"state_changes\[0\] operation=create_location"):
+        controller.submit_action(save.campaign.id, text_action())
+
+    debug = controller.get_debug_snapshot(save.campaign.id)
+    assert debug.raw_model_output == raw
+    assert "Extra inputs are not permitted" in debug.validation_failure
+    assert controller.load_game(save.campaign.id).state.turn_number == 0
 
 
 def test_recent_turn_ordering(tmp_path) -> None:

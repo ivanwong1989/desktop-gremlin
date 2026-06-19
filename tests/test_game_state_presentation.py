@@ -6,7 +6,7 @@ from desktop_gremlin.game.actions import StateChangeOperation
 from desktop_gremlin.game.errors import InvalidStateChangeError
 from desktop_gremlin.game.game_controller import GameController
 from desktop_gremlin.game.initial_state_generator import InitialStateGenerator
-from desktop_gremlin.game.models import StateChange
+from desktop_gremlin.game.models import StateChange, parse_state_change
 from desktop_gremlin.persistence.json_repository import JsonGameRepository
 from desktop_gremlin.ui.developer_inspector import developer_inspector_text
 from desktop_gremlin.ui.game_state_panel import game_state_text
@@ -77,12 +77,12 @@ def test_manual_correction_creates_audit_event(tmp_path) -> None:
 
 def test_invalid_manual_correction_is_rejected(tmp_path) -> None:
     controller, save, _llm = build_turn_controller(tmp_path, [json_response(narrator_payload())])
-    change = StateChange(
-        operation=StateChangeOperation.REMOVE_ITEM,
-        target_id="letter",
-        parameters={"quantity": 99},
-        reason="Invalid correction.",
-    )
+    change = parse_state_change({
+        "operation": StateChangeOperation.REMOVE_ITEM,
+        "target_id": "letter",
+        "parameters": {"quantity": 99},
+        "reason": "Invalid correction.",
+    })
 
     with pytest.raises(InvalidStateChangeError):
         controller.apply_manual_correction(save.campaign.id, change)

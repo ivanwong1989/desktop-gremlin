@@ -12,6 +12,10 @@ class InitialStateGenerationError(GameDomainError):
 class NarratorTurnError(GameDomainError):
     """Raised when the narrator cannot produce a valid turn."""
 
+    def __init__(self, message: str, *, raw_output: str | None = None):
+        super().__init__(message)
+        self.raw_output = raw_output
+
 
 class InvalidStateChangeError(GameDomainError):
     """Raised when a proposed state change is not valid for the current game state."""

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from .models import GameSave, PlayerAction
+from .models import GameSave, PlayerAction, state_change_operation_reference
 from .schemas import NARRATOR_TURN_SCHEMA
 
 
@@ -17,7 +17,8 @@ class ContextAssembler:
                 "content": (
                     "You are the narrator for a turn-by-turn storytelling game. "
                     "Return only a complete NarratorTurn JSON object. "
-                    "Do not stream prose outside JSON. Python owns canonical state."
+                    "Never invent fields outside the schema. Do not stream prose outside JSON. "
+                    "Python owns canonical state."
                 ),
             },
             {"role": "user", "content": self.build_context_text(save, action)},
@@ -28,7 +29,20 @@ class ContextAssembler:
         current_location = state.locations[state.current_location_id]
         recent_turns = save.recent_turns[-self.max_recent_turns :]
         sections = [
-            ("Narrator rules", "Propose narrative, choices, and approved state_changes only."),
+            (
+                "Narrator rules",
+                "\n".join(
+                    [
+                        "Propose narrative, choices, and approved state_changes only.",
+                        "Never invent fields outside the schema.",
+                        "For create operations, put the new entity ID in parameters.id.",
+                        "Do not provide target_id for create_location or create_character.",
+                        "For operations acting on existing entities, use target_id where required.",
+                        "State changes are applied sequentially in array order.",
+                        "Return only a complete NarratorTurn JSON object.",
+                    ]
+                ),
+            ),
             ("Campaign premise", self.campaign_text(save)),
             ("Relevant initial canon", self.lore_text(save.initial_lore)),
             ("Canonical current state", json.dumps(state.model_dump(mode="json"), indent=2)),
@@ -47,6 +61,32 @@ class ContextAssembler:
             ("Rolling summary", save.story_summary.text),
             ("Recent turns", self.turns_text(recent_turns)),
             ("Current player action", action.model_dump_json(indent=2)),
+            ("State-change operation reference", state_change_operation_reference()),
+            (
+                "Valid state-change examples",
+                json.dumps(
+                    [
+                        {
+                            "operation": "create_location",
+                            "parameters": {
+                                "id": "office-pantry",
+                                "name": "Office Pantry",
+                                "description": "A small pantry near the office floor.",
+                                "discovered": True,
+                                "attributes": {},
+                            },
+                            "reason": "Ivan walks to the pantry to get coffee.",
+                        },
+                        {
+                            "operation": "move_character",
+                            "target_id": "ivan",
+                            "parameters": {"location_id": "office-pantry"},
+                            "reason": "Ivan enters the pantry.",
+                        },
+                    ],
+                    indent=2,
+                ),
+            ),
             ("Required output schema", json.dumps(NARRATOR_TURN_SCHEMA, indent=2)),
         ]
         return "\n\n".join(f"## {title}\n{content}" for title, content in sections)
